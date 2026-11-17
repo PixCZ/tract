@@ -684,6 +684,47 @@ mod tests {
         }
     }
 
+    /// Two AddMatMul in one run: the unrolled loop's partial sums must not leak from the first
+    /// product into the second.
+    #[test]
+    fn avx512_16x1_two_add_mat_mul() -> TractResult<()> {
+        if !is_x86_feature_detected!("avx512f") {
+            return Ok(());
+        }
+        let (m, k) = (16usize, 8usize);
+        let a: Vec<f32> = (0..m * k).map(|i| (i % 5) as f32 - 2.0).collect();
+        let b0: Vec<f32> = (0..k).map(|i| (i % 3) as f32 + 1.0).collect();
+        let b1: Vec<f32> = (0..k).map(|i| (i % 4) as f32 - 1.0).collect();
+        let expected: Vec<f32> =
+            (0..m).map(|r| (0..k).map(|i| a[r * k + i] * (b0[i] + b1[i])).sum()).collect();
+
+        let ker = avx512_mmm_f32_16x1.mmm();
+        let (pack_a, pack_b) = &ker.packings()[0];
+        let pa = pack_a.prepare_one(&Tensor::from_shape(&[m, k], &a)?, 1, 0)?;
+        let pb0 = pack_b.prepare_one(&Tensor::from_shape(&[k, 1], &b0)?, 0, 1)?;
+        let pb1 = pack_b.prepare_one(&Tensor::from_shape(&[k, 1], &b1)?, 0, 1)?;
+        let mut c = Tensor::zero::<f32>(&[m, 1])?;
+        unsafe {
+            let c_view = ker.c_view(Some(0), Some(1)).wrap(&c.view_mut());
+            let ops: TVec<FusedSpec> = tvec!(
+                FusedSpec::AddMatMul {
+                    a: AsInputValue::Borrowed(&*pa),
+                    b: AsInputValue::Borrowed(&*pb0),
+                    packing: 0
+                },
+                FusedSpec::AddMatMul {
+                    a: AsInputValue::Borrowed(&*pa),
+                    b: AsInputValue::Borrowed(&*pb1),
+                    packing: 0
+                },
+                FusedSpec::Store(c_view),
+            );
+            ker.run(m, 1, &ops)?;
+        }
+        assert_eq!(c.try_as_plain_ram()?.as_slice::<f32>()?, &*expected);
+        Ok(())
+    }
+
     #[test]
     fn avx512_128x1_add_unicast_with_strided_c() -> TractResult<()> {
         if !is_x86_feature_detected!("avx512f") {
