@@ -571,7 +571,9 @@ const X86_F32_CHOICES: &[KernelChoice] = &[
 
 /// n==1: below the widest matvec kernel's mr (128) the cost model picks a better-fitting kernel
 /// (16x1/32x1); at or above it the 128x1 is already optimal, so keep it. AMD has no
-/// n=1-calibrated mmv model yet, and keeps the fixed matvec dispatch.
+/// n=1-calibrated mmv model yet and keeps a fixed rule: 16x1 until the 128x1 would pad `m` to
+/// twice its size or more (the same cut as `pick_by_shape`). Measured on a Ryzen 9800X3D the
+/// 128x1 loses up to 4x at m=16..64 (it streams 128 padded weight rows whatever m is).
 fn avx512_mmv_f32(suitable: &[Suitable], query: &Query) -> Option<&'static str> {
     match super::vendor() {
         super::Vendor::Intel => match query.m {
@@ -584,7 +586,7 @@ fn avx512_mmv_f32(suitable: &[Suitable], query: &Query) -> Option<&'static str> 
             _ => Some(avx512_mmm_f32_128x1.name.as_str()),
         },
         _ => match query.m {
-            Some(m) if m < 31 => Some(avx512_mmm_f32_16x1.name.as_str()),
+            Some(m) if m <= 64 => Some(avx512_mmm_f32_16x1.name.as_str()),
             _ => Some(avx512_mmm_f32_128x1.name.as_str()),
         },
     }
@@ -648,6 +650,38 @@ mod tests {
             PackedPackedProblem::frame(&*avx512_mmm_f32_128x1, 1, m, 1, a, b).check()?;
         }
         Ok(())
+    }
+
+    /// A matrix-vector product must not pad a small `m` up to the 128x1 tile, for f32 and for
+    /// f16 weights alike, while a large `m` keeps it.
+    #[test]
+    fn mmv_tile_follows_m() {
+        if !is_x86_feature_detected!("avx512f") {
+            return;
+        }
+        let f16_weights = |m, k| Query {
+            weight: DatumType::F16.into(),
+            activation: DatumType::F32,
+            accumulators: tvec!(DatumType::F32),
+            store: None,
+            allow_extractor: true,
+            m: Some(m),
+            k: Some(k),
+            n: Some(1),
+        };
+        let dispatch = crate::MmmDispatch::native();
+        for query in
+            [Query::plain(DatumType::F32, Some(32), Some(64), Some(1)), f16_weights(32, 64)]
+        {
+            let (mmm, _, pe) = dispatch.pick(&query).unwrap();
+            assert!(mmm.nr() == 1 && mmm.mr() <= 32 && pe.is_none(), "m=32 got {}", mmm.name());
+        }
+        for query in
+            [Query::plain(DatumType::F32, Some(768), Some(256), Some(1)), f16_weights(768, 256)]
+        {
+            let (mmm, _, _) = dispatch.pick(&query).unwrap();
+            assert_eq!(mmm.name(), avx512_mmm_f32_128x1.name.as_str());
+        }
     }
 
     #[test]
